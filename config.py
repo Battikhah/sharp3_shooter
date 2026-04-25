@@ -1,17 +1,22 @@
-# ETFs
+# Future ETFs
 TICKERS = [
-    "SPY",  # S&P 500 ETF
-    "IVV",  # iShares Core S&P 500 ETF
-    "VOO",  # Vanguard S&P 500 ETF
-    "QQQ",  # Invesco QQQ Trust (tracks the Nasdaq-100)
-    "VTI",  # Vanguard Total Stock Market ETF
-    "IWM",  # iShares Russell 2000 ETF
-    "EFA",  # iShares MSCI EAFE ETF
+    # Equity ETFs
+    "SPY", # S&P 500 ETF
+    "QQQ", # Nasdaq 100 ETF
+    "IWM", # Russell 2000 ETF
+    "EFA", # MSCI EAFE ETF
+    "EEM", # MSCI Emerging Markets ETF
+    "VNQ", # Vanguard Real Estate ETF
 
-    #Halal ETFs
-    "SPUS",  # SPDR Portfolio S&P 500 ETF
-    "HLAL",  # Wahed FTSE USA Shariah ETF
-    "MNZL",  # Manzil Russell Halal USA Broad Market ETF
+    # Bond ETFs
+    "AGG",   # iShares Core U.S. Aggregate Bond ETF
+    "BND",   # Vanguard Total Bond Market ETF
+
+    # Commodities
+    "GLD",   # Gold
+    "SLV",   # Silver
+    "USO",   # Oil
+    "UNG",   # Natural gas
 ]
 
 # Data
