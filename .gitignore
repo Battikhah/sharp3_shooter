@@ -1,4 +1,7 @@
 ignore
 .venv/
 
-__pycache__/
+__pycache__
+checkpoints
+results
+__pycache__/config.cpython-312.pyc

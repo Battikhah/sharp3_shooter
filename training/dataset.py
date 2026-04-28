@@ -1,5 +1,6 @@
 import torch
 import pandas as pd
+
 class FuturesDataset(torch.utils.data.Dataset):
     def __init__(self, 
                 features_df: dict[str, pd.DataFrame],
@@ -36,16 +37,38 @@ class FuturesDataset(torch.utils.data.Dataset):
         return len(self.index)
 
     def __getitem__(self, idx):
-        # Returns a tuple of (X, y, ticker_id, fwd_return)
         ticker, end_idx = self.index[idx]
         df = self._data[ticker]
 
-        steart_row = end_idx - self.sequence_length + 1
+        start_row = end_idx - self.sequence_length + 1
 
-        X = df['features'][steart_row:end_idx + 1] 
+        X = torch.from_numpy(df['features'][start_row:end_idx + 1])
 
         ticker_id = torch.tensor(self.tickers_2_id[ticker], dtype=torch.long)
         fwd_return = torch.tensor(df['forward_return'][end_idx], dtype=torch.float32)
+        vs_factor = torch.tensor(df['vs_factor'][end_idx], dtype=torch.float32)
         target = torch.tensor(df['target'][end_idx], dtype=torch.float32)
 
-        return X, target, ticker_id, fwd_return
+        return X, target, ticker_id, fwd_return, vs_factor
+    
+if __name__ == "__main__":
+
+    from config import TICKERS, START_DATE, END_DATE
+    from data.fetch import fetch_data
+    from data.features import compute_features
+
+    # Fetch raw data
+    raw_data = fetch_data(TICKERS, START_DATE, END_DATE)
+
+    # Compute features
+    features = compute_features(raw_data)
+
+    # Create ticker to ID mapping
+    tickers_2_id = {ticker: idx for idx, ticker in enumerate(TICKERS)}
+
+    # Create Dataset
+    dataset = FuturesDataset(features, sequence_length=252, tickers_2_id=tickers_2_id)
+
+    print(f"Dataset Length: {len(dataset)}")
+    X, y, ticker_id, fwd_return, vs_factor = dataset[0]
+    print(f"X shape: {X.shape}, y: {y}, ticker_id: {ticker_id}, fwd_return: {fwd_return}, vs_factor: {vs_factor}")

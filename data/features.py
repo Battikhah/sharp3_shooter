@@ -1,13 +1,13 @@
 import pandas as pd
-from config import RETURN_HORIZONS, MACD_PAIRS
+from config import RETURN_HORIZONS, MACD_PAIRS, VOL_SPAN
 
 def compute_features(prices: pd.DataFrame) -> dict[str, pd.DataFrame]:
     results = {}
     
-    for ticker in prices.columns:
-        p = prices[ticker].dropna() # Closing Prices
+    for ticker in prices.columns.get_level_values(0).unique():
+        p = prices[ticker]['Close'].dropna() # Closing Prices
         r = p.pct_change().dropna() # Daily Returns
-        ewma_vol = r.ewm(span=60).std()
+        ewma_vol = r.ewm(span=VOL_SPAN).std()
 
         features = pd.DataFrame(index=r.index)
 
@@ -18,7 +18,7 @@ def compute_features(prices: pd.DataFrame) -> dict[str, pd.DataFrame]:
         # MACD Signals
         for short, long in MACD_PAIRS:
             macd = p.ewm(span=short).mean() - p.ewm(span=long).mean()
-            q = macd / r.rolling(window=63).std()
+            q = macd / p.rolling(window=63).std()
             features[f'macd_signal_{short}_{long}'] = q / q.rolling(window=252).std()
 
         # Volatility-Scaling Factor

@@ -31,12 +31,16 @@ PATIENCE = 20 # Early stopping patience
 TARGET_VOL = 0.1 # Target volatility for dynamic position sizing
 
 # Features, more will be added, just basing off of the original paper for now
-VOL_SPAN = 20 # Lookback period for volatility calculation, might be changed later
+VOL_SPAN = 60 # EWMA span for volatility (per paper Appendix A)
 RETURN_HORIZONS = [1, 5, 21, 63, 126, 252] # Return horizons in trading days
 MACD_PAIRS = [(8, 24), (16, 48), (32, 96)] # MACD short and long periods
 
 # Model (VLSTM)
-# TO be filled out later
+SEQUENCE_LENGTH = 84
+HIDDEN_DIM = 256
+NUM_LSTM_LAYERS = 2
+DROPOUT = 0.3
+NUM_FEATURES = len(RETURN_HORIZONS) + len(MACD_PAIRS)  # vs_factor is metadata, not a model input
 
 # Walk forward, rolling window, and backtesting
 TRAIN_YEARS = 5

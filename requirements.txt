@@ -1,4 +1,6 @@
 appnope==0.1.4
+eventkit==1.0.3
+ib_insync==0.9.86
 asttokens==3.0.1
 beautifulsoup4==4.14.3
 certifi==2026.4.22
