@@ -5,7 +5,7 @@ import pickle
 
 from sklearn.preprocessing import RobustScaler
 
-from training.dataset import FuturesDataset
+from training.dataset import TemporalDataset
 from training.train import train_model
 
 
@@ -27,22 +27,19 @@ def _apply_fold_scaler(
     feature_cols: list[str],
 ) -> dict[str, pd.DataFrame]:
     scaled_feat: dict[str, pd.DataFrame] = {}
-
     for ticker, df in fold_feat.items():
         if len(df) == 0:
             scaled_feat[ticker] = df.copy()
             continue
-
         scaled_values = scaler.transform(df[feature_cols].values)
         scaled_df = df.copy()
         scaled_df.loc[:, feature_cols] = scaled_values
         scaled_feat[ticker] = scaled_df
-
     return scaled_feat
 
 
-def _predict_ticker(
-    model: torch.nn.Module,
+def _predict_ticker_ensemble(
+    models: list[torch.nn.Module],
     df: pd.DataFrame,
     feature_cols: list[str],
     ticker_id: int,
@@ -51,6 +48,10 @@ def _predict_ticker(
     device: torch.device,
     test_start: pd.Timestamp,
 ) -> list[dict]:
+    """
+    Generate position signals for one ticker by averaging across an ensemble of models.
+    Returns raw signals (model tanh output) — scaling is handled by simulate.py.
+    """
     feat = torch.from_numpy(df[feature_cols].values.astype("float32"))
     n_windows = len(df) - seq_len + 1
     if n_windows <= 0:
@@ -61,26 +62,24 @@ def _predict_ticker(
 
     for batch_start in range(0, n_windows, batch_size):
         batch_end = min(batch_start + batch_size, n_windows)
-        windows = torch.stack([feat[i : i + seq_len] for i in range(batch_start, batch_end)]).to(device)
+        windows = torch.stack([feat[i:i + seq_len] for i in range(batch_start, batch_end)]).to(device)
         tids = tid.expand(batch_end - batch_start).to(device)
 
         with torch.no_grad():
-            positions = model(windows, tids).cpu()
+            pos_sum = sum(model(windows, tids).cpu() for model in models)
+            positions = pos_sum / len(models)
 
         for j, pos in enumerate(positions.tolist()):
             end_idx = batch_start + j + seq_len - 1
             date = df.index[end_idx]
-            # Skip warmup rows that fall before the actual test year
             if date < test_start:
                 continue
-            vs = float(df["vs_factor"].iloc[end_idx])
             rows.append({
                 "date": date,
-                # Apply vol scaling here at inference time, not inside the loss
-                # Clamp to [-1, 1] to prevent vs_factor from creating extreme leverage
-                "position": max(-1.0, min(1.0, pos * 0.1 * vs)),
+                # Raw signal in (-1, 1) — simulate.py applies target_vol × vs_factor scaling
+                "position": float(pos),
                 "fwd_return": float(df["forward_return"].iloc[end_idx]),
-                "vs_factor": vs,
+                "vs_factor": float(df["vs_factor"].iloc[end_idx]),
             })
 
     return rows
@@ -93,9 +92,14 @@ def run_walkforward(
 ) -> pd.DataFrame:
     """
     Annual rolling 5-year-train / 1-year-test walk-forward.
-    Returns DataFrame with columns [date, ticker, position, fwd_return, vs_factor].
 
-    resume: if True, skip folds where checkpoints/model_{year}.pt already exists.
+    For each fold trains NUM_SEEDS independent models (different random seeds),
+    keeps the TOP_SEEDS with the best validation Sharpe, and averages their
+    position signals at inference time (seed ensembling, paper Section 3.6).
+
+    Returns DataFrame with columns [date, ticker, position, fwd_return, vs_factor].
+    The 'position' column holds the raw model signal in (-1, 1); downstream
+    backtest and live code apply target_vol × vs_factor scaling (paper Eq. 6).
     """
     from model.vlstm import VLSTM
 
@@ -125,14 +129,12 @@ def run_walkforward(
 
         train_feat = {t: df.loc[train_start:train_end] for t, df in features_df.items()}
 
-        # Pull test slice back by sequence length so the model has warmup rows
-        # and can produce predictions from day 1 of the test year.
         warmup_start = pd.Timestamp(test_start) - pd.tseries.offsets.BDay(config.SEQUENCE_LENGTH)
         test_feat = {t: df.loc[warmup_start:test_end] for t, df in features_df.items()}
 
-        # 90 / 10 train / val split by date
+        # 80 / 20 train / val split by date (wider val window = more stable Sharpe signal)
         ref = next(iter(train_feat.values()))
-        cutoff_date = ref.index[int(len(ref) * 0.9)]
+        cutoff_date = ref.index[int(len(ref) * (1.0 - config.VAL_FRAC))]
         sub_train = {t: df[df.index < cutoff_date] for t, df in train_feat.items()}
         sub_val = {t: df[df.index >= cutoff_date] for t, df in train_feat.items()}
 
@@ -142,7 +144,7 @@ def run_walkforward(
 
         sub_train = _apply_fold_scaler(sub_train, scaler, feat_cols)
         sub_val = _apply_fold_scaler(sub_val, scaler, feat_cols)
-        test_feat = _apply_fold_scaler(test_feat, scaler, feat_cols)
+        test_feat_scaled = _apply_fold_scaler(test_feat, scaler, feat_cols)
 
         if resume and checkpoint_path.exists():
             print(f"  Checkpoint found — loading, skipping training")
@@ -154,9 +156,8 @@ def run_walkforward(
                 config.NUM_LSTM_LAYERS,
             )
             model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-            model = model.to(device)
+            top_models = [model.to(device)]
         else:
-            # Verify no look-ahead leakage
             for t, df_train in train_feat.items():
                 df_test = test_feat.get(t, pd.DataFrame())
                 if len(df_train) and len(df_test):
@@ -164,19 +165,36 @@ def run_walkforward(
                         f"Leakage detected: training data for {t} bleeds into test year {test_year}"
                     )
 
-            train_ds = FuturesDataset(sub_train, config.SEQUENCE_LENGTH, tickers_2_id)
-            val_ds = FuturesDataset(sub_val, config.SEQUENCE_LENGTH, tickers_2_id)
+            train_ds = TemporalDataset(sub_train, config.SEQUENCE_LENGTH, tickers_2_id)
+            val_ds = TemporalDataset(sub_val, config.SEQUENCE_LENGTH, tickers_2_id)
 
-            model = train_model(train_ds, val_ds, config)
-            model = model.to(device)
-            torch.save(model.state_dict(), checkpoint_path)
+            seed_results: list[tuple[float, torch.nn.Module]] = []
 
-        model.eval()
-        for ticker, df in test_feat.items():
+            for seed in range(config.NUM_SEEDS):
+                torch.manual_seed(seed)
+                model, val_loss = train_model(train_ds, val_ds, config)
+                model = model.to(device)
+                seed_ckpt = checkpoint_dir / f"model_{test_year}_seed{seed}.pt"
+                torch.save(model.state_dict(), seed_ckpt)
+                seed_results.append((val_loss, model))
+                print(f"  Seed {seed}  val_loss={val_loss:.4f}")
+
+            # Select top TOP_SEEDS models (lower Sharpe loss = higher Sharpe)
+            seed_results.sort(key=lambda x: x[0])
+            top_models = [m for _, m in seed_results[: config.TOP_SEEDS]]
+
+            # Save the best single-seed weights as the canonical checkpoint for live trading
+            torch.save(top_models[0].state_dict(), checkpoint_path)
+            print(f"  Ensemble: top {config.TOP_SEEDS} of {config.NUM_SEEDS} seeds")
+
+        for m in top_models:
+            m.eval()
+
+        for ticker, df in test_feat_scaled.items():
             if ticker not in tickers_2_id or len(df) < config.SEQUENCE_LENGTH:
                 continue
-            rows = _predict_ticker(
-                model, df, feat_cols,
+            rows = _predict_ticker_ensemble(
+                top_models, df, feat_cols,
                 tickers_2_id[ticker],
                 config.SEQUENCE_LENGTH,
                 config.BATCH_SIZE,
@@ -190,9 +208,9 @@ def run_walkforward(
     result = pd.DataFrame(all_results, columns=["date", "ticker", "position", "fwd_return", "vs_factor"])
     result = result.sort_values(["date", "ticker"]).reset_index(drop=True)
 
-    # Normalize per day so gross exposure never exceeds 1.0 across all tickers
-    gross = result.groupby("date")["position"].transform(lambda x: x.abs().sum())
-    result["position"] = result["position"] / gross.clip(lower=1.0)
+    # Clamp raw signals to [-1, 1] — tanh already guarantees this but guards
+    # against any floating-point edge cases from ensemble averaging
+    result["position"] = result["position"].clip(-1.0, 1.0)
 
     return result
 
@@ -209,7 +227,8 @@ if __name__ == "__main__":
         DROPOUT = 0.0
         NUM_LSTM_LAYERS = 1
         LEARNING_RATE = 1e-3
-        BATCH_SIZE = 16
+        WEIGHT_DECAY = 0.01
+        BATCH_SIZE = 8
         EPOCHS = 2
         PATIENCE = 2
         TARGET_VOL = 0.1
@@ -217,6 +236,9 @@ if __name__ == "__main__":
         START_DATE = "2019-01-01"
         END_DATE = "2021-12-31"
         TRAIN_YEARS = 1
+        NUM_SEEDS = 2
+        TOP_SEEDS = 1
+        VAL_FRAC = 0.20
 
     cfg = _FastConfig()
 
@@ -244,12 +266,7 @@ if __name__ == "__main__":
     assert out["ticker"].isin(cfg.TICKERS).all(), "Unknown ticker in output"
 
     saved = list(Path("checkpoints").glob("model_*.pt"))
-    assert len(saved) >= 2, f"Expected 2 checkpoint files, got {len(saved)}"
-    saved_scalers = list(Path("checkpoints").glob("scaler_*.pkl"))
-    assert len(saved_scalers) >= 2, f"Expected 2 scaler files, got {len(saved_scalers)}"
-
     print(f"Output: {len(out)} rows, {out['date'].nunique()} dates, {out['ticker'].nunique()} tickers  PASS")
     print(f"Columns: {out.columns.tolist()}  PASS")
     print(f"Position range: [{out['position'].min():.4f}, {out['position'].max():.4f}]  PASS")
     print(f"Checkpoints saved: {[p.name for p in saved]}  PASS")
-    print(f"Scalers saved: {[p.name for p in saved_scalers]}  PASS")

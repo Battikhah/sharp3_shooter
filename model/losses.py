@@ -24,6 +24,27 @@ def sharpe_loss(
     return -sharpe
 
 
+def portfolio_sharpe_loss(
+    positions: torch.Tensor,
+    fwd_returns: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Differentiable negative Sharpe ratio on cross-sectional portfolio returns.
+
+    positions:   (T, K) — one signal per ticker per timestep
+    fwd_returns: (T, K) — next-day returns per ticker
+
+    At each timestep the equal-weight cross-sectional average is taken first
+    (paper Eq. 8), then Sharpe is computed on the resulting return series.
+    This matches the paper's "pooled portfolio returns" training objective.
+    """
+    port_returns = (positions * fwd_returns).mean(dim=-1)   # (T,) cross-sectional avg
+    mean = port_returns.mean()
+    std = port_returns.std()
+    return -(mean / (std + eps)) * (252 ** 0.5)
+
+
 if __name__ == "__main__":
     # --- Test 1: scalar, requires_grad, backward ---
     n = 256

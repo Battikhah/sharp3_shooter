@@ -19,7 +19,9 @@ from ib_insync import IB, Stock
 from ib_insync import Order as IBKROrder
 
 LOG_PATH = Path("results/orders.log")
-MAX_POSITION_PCT: float = 0.20
+# With TARGET_VOL=0.10 and annualised vs_factor, a full-conviction signal on a
+# 16%-vol asset produces ~62.5% of NAV — the old 20% cap would block everything.
+MAX_POSITION_PCT: float = 0.50
 MAX_TURNOVER_PCT: float = 2.00
 FLIP_THRESHOLD: float = 1.50
 

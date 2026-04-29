@@ -21,8 +21,9 @@ def compute_features(prices: pd.DataFrame) -> dict[str, pd.DataFrame]:
             q = macd / p.rolling(window=63).std()
             features[f'macd_signal_{short}_{long}'] = q / q.rolling(window=252).std()
 
-        # Volatility-Scaling Factor
-        features['vs_factor'] = 1 / ewma_vol
+        # Volatility-Scaling Factor — annualised so that signal × TARGET_VOL × vs_factor
+        # gives a weight in economically sensible units (paper Eq. 6, Appendix A.2).
+        features['vs_factor'] = 1.0 / (ewma_vol * 252 ** 0.5)
 
         # Look Into the Future
         features['target'] = (r.shift(-1) / ewma_vol).clip(-20, 20) # Acts as the Label for training

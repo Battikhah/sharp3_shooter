@@ -51,6 +51,81 @@ class FuturesDataset(torch.utils.data.Dataset):
 
         return X, target, ticker_id, fwd_return, vs_factor
     
+class TemporalDataset(torch.utils.data.Dataset):
+    """
+    Each item is one trading date; returns tensors for ALL K tickers at that date.
+
+    This enables portfolio-level Sharpe optimisation: the training loss can compute
+    the cross-sectional average return across tickers before computing Sharpe, which
+    is the paper's "pooled portfolio returns" objective (Eq. 8–10).
+
+    Returns per item:
+        X   (K, seq_len, C)   — lookback windows for every ticker
+        tid (K,)              — ticker integer IDs
+        fwd (K,)              — next-day forward returns
+        vs  (K,)              — volatility-scaling factors
+    """
+    def __init__(
+        self,
+        features_df: dict[str, "pd.DataFrame"],
+        sequence_length: int,
+        tickers_2_id: dict[str, int],
+    ):
+        self.sequence_length = sequence_length
+        self.tickers_2_id = tickers_2_id
+
+        sample = next(iter(features_df.values()))
+        self.feature_cols = [c for c in sample.columns if c not in ("target", "forward_return", "vs_factor")]
+
+        self._data: dict[str, dict] = {}
+        valid_per_ticker: dict[str, set] = {}
+
+        for ticker, df in features_df.items():
+            if ticker not in tickers_2_id or len(df) < sequence_length:
+                continue
+            self._data[ticker] = {
+                "features": df[self.feature_cols].values.astype("float32"),
+                "forward_return": df["forward_return"].values.astype("float32"),
+                "vs_factor": df["vs_factor"].values.astype("float32"),
+                "date_to_idx": {d: i for i, d in enumerate(df.index)},
+            }
+            # Dates that have at least seq_len rows of prior history
+            valid_per_ticker[ticker] = set(df.index[sequence_length - 1:])
+
+        # Only keep dates where every ticker has a full lookback window
+        if valid_per_ticker:
+            common = set.intersection(*valid_per_ticker.values())
+            self.valid_dates = sorted(common)
+        else:
+            self.valid_dates = []
+
+        # Stable ticker ordering (follows TICKERS list order via tickers_2_id insertion order)
+        self.tickers = [t for t in tickers_2_id if t in self._data]
+
+    def __len__(self) -> int:
+        return len(self.valid_dates)
+
+    def __getitem__(self, idx: int):
+        date = self.valid_dates[idx]
+        X_list, tid_list, fwd_list, vs_list = [], [], [], []
+
+        for ticker in self.tickers:
+            data = self._data[ticker]
+            end = data["date_to_idx"][date]
+            start = end - self.sequence_length + 1
+            X_list.append(torch.from_numpy(data["features"][start:end + 1]))
+            tid_list.append(self.tickers_2_id[ticker])
+            fwd_list.append(data["forward_return"][end])
+            vs_list.append(data["vs_factor"][end])
+
+        return (
+            torch.stack(X_list),                               # (K, seq_len, C)
+            torch.tensor(tid_list, dtype=torch.long),          # (K,)
+            torch.tensor(fwd_list, dtype=torch.float32),       # (K,)
+            torch.tensor(vs_list, dtype=torch.float32),        # (K,)
+        )
+
+
 if __name__ == "__main__":
 
     from config import TICKERS, START_DATE, END_DATE
