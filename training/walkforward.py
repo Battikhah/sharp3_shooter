@@ -18,6 +18,7 @@ def _predict_ticker(
     ticker_id: int,
     seq_len: int,
     batch_size: int,
+    device: torch.device,
 ) -> list[dict]:
     feat = torch.from_numpy(df[feature_cols].values.astype("float32"))
     n_windows = len(df) - seq_len + 1
@@ -29,11 +30,11 @@ def _predict_ticker(
 
     for batch_start in range(0, n_windows, batch_size):
         batch_end = min(batch_start + batch_size, n_windows)
-        windows = torch.stack([feat[i : i + seq_len] for i in range(batch_start, batch_end)])
-        tids = tid.expand(batch_end - batch_start)
+        windows = torch.stack([feat[i : i + seq_len] for i in range(batch_start, batch_end)]).to(device)
+        tids = tid.expand(batch_end - batch_start).to(device)
 
         with torch.no_grad():
-            positions = model(windows, tids)
+            positions = model(windows, tids).cpu()
 
         for j, pos in enumerate(positions.tolist()):
             end_idx = batch_start + j + seq_len - 1
@@ -47,11 +48,21 @@ def _predict_ticker(
     return rows
 
 
-def run_walkforward(features_df: dict[str, pd.DataFrame], config) -> pd.DataFrame:
+def run_walkforward(
+    features_df: dict[str, pd.DataFrame],
+    config,
+    resume: bool = False,
+) -> pd.DataFrame:
     """
     Annual rolling 5-year-train / 1-year-test walk-forward.
     Returns DataFrame with columns [date, ticker, position, fwd_return, vs_factor].
+
+    resume: if True, skip folds where checkpoints/model_{year}.pt already exists.
     """
+    from model.vlstm import VLSTM
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     tickers_2_id = {t: i for i, t in enumerate(config.TICKERS)}
     feat_cols = _feature_cols(features_df)
 
@@ -69,30 +80,46 @@ def run_walkforward(features_df: dict[str, pd.DataFrame], config) -> pd.DataFram
         test_start = f"{test_year}-01-01"
         test_end = f"{test_year}-12-31"
 
+        checkpoint_path = checkpoint_dir / f"model_{test_year}.pt"
+
         print(f"[{test_year}] train {train_start} → {train_end} | test {test_start} → {test_end}")
 
-        train_feat = {t: df.loc[train_start:train_end] for t, df in features_df.items()}
         test_feat = {t: df.loc[test_start:test_end] for t, df in features_df.items()}
 
-        # Verify no look-ahead leakage
-        for t, df_train in train_feat.items():
-            df_test = test_feat.get(t, pd.DataFrame())
-            if len(df_train) and len(df_test):
-                assert df_train.index.max() < pd.Timestamp(test_start), (
-                    f"Leakage detected: training data for {t} bleeds into test year {test_year}"
-                )
+        if resume and checkpoint_path.exists():
+            print(f"  Checkpoint found — loading, skipping training")
+            model = VLSTM(
+                config.NUM_FEATURES,
+                config.HIDDEN_DIM,
+                len(tickers_2_id),
+                config.DROPOUT,
+                config.NUM_LSTM_LAYERS,
+            )
+            model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+            model = model.to(device)
+        else:
+            train_feat = {t: df.loc[train_start:train_end] for t, df in features_df.items()}
 
-        # 90 / 10 train / val split by date
-        ref = next(iter(train_feat.values()))
-        cutoff_date = ref.index[int(len(ref) * 0.9)]
-        sub_train = {t: df[df.index < cutoff_date] for t, df in train_feat.items()}
-        sub_val = {t: df[df.index >= cutoff_date] for t, df in train_feat.items()}
+            # Verify no look-ahead leakage
+            for t, df_train in train_feat.items():
+                df_test = test_feat.get(t, pd.DataFrame())
+                if len(df_train) and len(df_test):
+                    assert df_train.index.max() < pd.Timestamp(test_start), (
+                        f"Leakage detected: training data for {t} bleeds into test year {test_year}"
+                    )
 
-        train_ds = FuturesDataset(sub_train, config.SEQUENCE_LENGTH, tickers_2_id)
-        val_ds = FuturesDataset(sub_val, config.SEQUENCE_LENGTH, tickers_2_id)
+            # 90 / 10 train / val split by date
+            ref = next(iter(train_feat.values()))
+            cutoff_date = ref.index[int(len(ref) * 0.9)]
+            sub_train = {t: df[df.index < cutoff_date] for t, df in train_feat.items()}
+            sub_val = {t: df[df.index >= cutoff_date] for t, df in train_feat.items()}
 
-        model = train_model(train_ds, val_ds, config)
-        torch.save(model.state_dict(), checkpoint_dir / f"model_{test_year}.pt")
+            train_ds = FuturesDataset(sub_train, config.SEQUENCE_LENGTH, tickers_2_id)
+            val_ds = FuturesDataset(sub_val, config.SEQUENCE_LENGTH, tickers_2_id)
+
+            model = train_model(train_ds, val_ds, config)
+            model = model.to(device)
+            torch.save(model.state_dict(), checkpoint_path)
 
         model.eval()
         for ticker, df in test_feat.items():
@@ -103,6 +130,7 @@ def run_walkforward(features_df: dict[str, pd.DataFrame], config) -> pd.DataFram
                 tickers_2_id[ticker],
                 config.SEQUENCE_LENGTH,
                 config.BATCH_SIZE,
+                device,
             )
             for row in rows:
                 row["ticker"] = ticker

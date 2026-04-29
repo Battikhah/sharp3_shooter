@@ -13,6 +13,9 @@ def train_model(train_dataset, val_dataset, config) -> nn.Module:
     Trains VLSTM with early stopping on validation Sharpe loss.
     Returns the model with best validation performance.
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Training on {device}")
+
     num_tickers = len(config.TICKERS)
     model = VLSTM(
         config.NUM_FEATURES,
@@ -20,7 +23,7 @@ def train_model(train_dataset, val_dataset, config) -> nn.Module:
         num_tickers,
         config.DROPOUT,
         config.NUM_LSTM_LAYERS,
-    )
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
 
     train_loader = DataLoader(
@@ -40,6 +43,10 @@ def train_model(train_dataset, val_dataset, config) -> nn.Module:
     for epoch in range(config.EPOCHS):
         model.train()
         for X, _target, ticker_id, fwd_return, vs_factor in train_loader:
+            X = X.to(device)
+            ticker_id = ticker_id.to(device)
+            fwd_return = fwd_return.to(device)
+            vs_factor = vs_factor.to(device)
             optimizer.zero_grad()
             positions = model(X, ticker_id)
             loss = sharpe_loss(positions, fwd_return, vs_factor, config.TARGET_VOL)
@@ -51,6 +58,10 @@ def train_model(train_dataset, val_dataset, config) -> nn.Module:
         val_losses = []
         with torch.no_grad():
             for X, _target, ticker_id, fwd_return, vs_factor in val_loader:
+                X = X.to(device)
+                ticker_id = ticker_id.to(device)
+                fwd_return = fwd_return.to(device)
+                vs_factor = vs_factor.to(device)
                 positions = model(X, ticker_id)
                 val_loss = sharpe_loss(positions, fwd_return, vs_factor, config.TARGET_VOL)
                 val_losses.append(val_loss.item())
@@ -62,7 +73,7 @@ def train_model(train_dataset, val_dataset, config) -> nn.Module:
 
         if mean_val_loss < best_val_loss:
             best_val_loss = mean_val_loss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             torch.save(best_state, checkpoint_path)
             patience_count = 0
         else:
