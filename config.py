@@ -24,11 +24,11 @@ START_DATE = "2010-01-01"
 END_DATE = "2025-12-31"
 
 # Training
-BATCH_SIZE = 128
-LEARNING_RATE = 1e-4
-EPOCHS = 50
-PATIENCE = 20 # Early stopping patience
-TARGET_VOL = 0.1 # Target volatility for dynamic position sizing
+BATCH_SIZE = 256
+LEARNING_RATE = 5e-5
+EPOCHS = 100
+PATIENCE = 50
+TARGET_VOL = 0.175 # Target volatility for dynamic position sizing
 
 # Features, more will be added, just basing off of the original paper for now
 VOL_SPAN = 60 # EWMA span for volatility (per paper Appendix A)
@@ -37,9 +37,9 @@ MACD_PAIRS = [(8, 24), (16, 48), (32, 96)] # MACD short and long periods
 
 # Model (VLSTM)
 SEQUENCE_LENGTH = 84
-HIDDEN_DIM = 256
+HIDDEN_DIM = 128
 NUM_LSTM_LAYERS = 2
-DROPOUT = 0.3
+DROPOUT = 0.2
 NUM_FEATURES = len(RETURN_HORIZONS) + len(MACD_PAIRS)  # vs_factor is metadata, not a model input
 
 # Walk forward, rolling window, and backtesting

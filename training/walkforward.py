@@ -1,6 +1,9 @@
 import torch
 import pandas as pd
 from pathlib import Path
+import pickle
+
+from sklearn.preprocessing import RobustScaler
 
 from training.dataset import FuturesDataset
 from training.train import train_model
@@ -11,6 +14,33 @@ def _feature_cols(features_df: dict[str, pd.DataFrame]) -> list[str]:
     return [c for c in sample.columns if c not in ("target", "forward_return", "vs_factor")]
 
 
+def _fit_fold_scaler(train_feat: dict[str, pd.DataFrame], feature_cols: list[str]) -> RobustScaler:
+    scaler = RobustScaler()
+    train_matrix = pd.concat([df[feature_cols] for df in train_feat.values() if len(df)], axis=0)
+    scaler.fit(train_matrix.values)
+    return scaler
+
+
+def _apply_fold_scaler(
+    fold_feat: dict[str, pd.DataFrame],
+    scaler: RobustScaler,
+    feature_cols: list[str],
+) -> dict[str, pd.DataFrame]:
+    scaled_feat: dict[str, pd.DataFrame] = {}
+
+    for ticker, df in fold_feat.items():
+        if len(df) == 0:
+            scaled_feat[ticker] = df.copy()
+            continue
+
+        scaled_values = scaler.transform(df[feature_cols].values)
+        scaled_df = df.copy()
+        scaled_df.loc[:, feature_cols] = scaled_values
+        scaled_feat[ticker] = scaled_df
+
+    return scaled_feat
+
+
 def _predict_ticker(
     model: torch.nn.Module,
     df: pd.DataFrame,
@@ -19,6 +49,7 @@ def _predict_ticker(
     seq_len: int,
     batch_size: int,
     device: torch.device,
+    test_start: pd.Timestamp,
 ) -> list[dict]:
     feat = torch.from_numpy(df[feature_cols].values.astype("float32"))
     n_windows = len(df) - seq_len + 1
@@ -38,11 +69,18 @@ def _predict_ticker(
 
         for j, pos in enumerate(positions.tolist()):
             end_idx = batch_start + j + seq_len - 1
+            date = df.index[end_idx]
+            # Skip warmup rows that fall before the actual test year
+            if date < test_start:
+                continue
+            vs = float(df["vs_factor"].iloc[end_idx])
             rows.append({
-                "date": df.index[end_idx],
-                "position": pos,
+                "date": date,
+                # Apply vol scaling here at inference time, not inside the loss
+                # Clamp to [-1, 1] to prevent vs_factor from creating extreme leverage
+                "position": max(-1.0, min(1.0, pos * 0.1 * vs)),
                 "fwd_return": float(df["forward_return"].iloc[end_idx]),
-                "vs_factor": float(df["vs_factor"].iloc[end_idx]),
+                "vs_factor": vs,
             })
 
     return rows
@@ -81,10 +119,30 @@ def run_walkforward(
         test_end = f"{test_year}-12-31"
 
         checkpoint_path = checkpoint_dir / f"model_{test_year}.pt"
+        scaler_path = checkpoint_dir / f"scaler_{test_year}.pkl"
 
         print(f"[{test_year}] train {train_start} → {train_end} | test {test_start} → {test_end}")
 
-        test_feat = {t: df.loc[test_start:test_end] for t, df in features_df.items()}
+        train_feat = {t: df.loc[train_start:train_end] for t, df in features_df.items()}
+
+        # Pull test slice back by sequence length so the model has warmup rows
+        # and can produce predictions from day 1 of the test year.
+        warmup_start = pd.Timestamp(test_start) - pd.tseries.offsets.BDay(config.SEQUENCE_LENGTH)
+        test_feat = {t: df.loc[warmup_start:test_end] for t, df in features_df.items()}
+
+        # 90 / 10 train / val split by date
+        ref = next(iter(train_feat.values()))
+        cutoff_date = ref.index[int(len(ref) * 0.9)]
+        sub_train = {t: df[df.index < cutoff_date] for t, df in train_feat.items()}
+        sub_val = {t: df[df.index >= cutoff_date] for t, df in train_feat.items()}
+
+        scaler = _fit_fold_scaler(sub_train, feat_cols)
+        with open(scaler_path, "wb") as f:
+            pickle.dump(scaler, f)
+
+        sub_train = _apply_fold_scaler(sub_train, scaler, feat_cols)
+        sub_val = _apply_fold_scaler(sub_val, scaler, feat_cols)
+        test_feat = _apply_fold_scaler(test_feat, scaler, feat_cols)
 
         if resume and checkpoint_path.exists():
             print(f"  Checkpoint found — loading, skipping training")
@@ -98,8 +156,6 @@ def run_walkforward(
             model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
             model = model.to(device)
         else:
-            train_feat = {t: df.loc[train_start:train_end] for t, df in features_df.items()}
-
             # Verify no look-ahead leakage
             for t, df_train in train_feat.items():
                 df_test = test_feat.get(t, pd.DataFrame())
@@ -107,12 +163,6 @@ def run_walkforward(
                     assert df_train.index.max() < pd.Timestamp(test_start), (
                         f"Leakage detected: training data for {t} bleeds into test year {test_year}"
                     )
-
-            # 90 / 10 train / val split by date
-            ref = next(iter(train_feat.values()))
-            cutoff_date = ref.index[int(len(ref) * 0.9)]
-            sub_train = {t: df[df.index < cutoff_date] for t, df in train_feat.items()}
-            sub_val = {t: df[df.index >= cutoff_date] for t, df in train_feat.items()}
 
             train_ds = FuturesDataset(sub_train, config.SEQUENCE_LENGTH, tickers_2_id)
             val_ds = FuturesDataset(sub_val, config.SEQUENCE_LENGTH, tickers_2_id)
@@ -131,13 +181,20 @@ def run_walkforward(
                 config.SEQUENCE_LENGTH,
                 config.BATCH_SIZE,
                 device,
+                pd.Timestamp(test_start),
             )
             for row in rows:
                 row["ticker"] = ticker
             all_results.extend(rows)
 
     result = pd.DataFrame(all_results, columns=["date", "ticker", "position", "fwd_return", "vs_factor"])
-    return result.sort_values(["date", "ticker"]).reset_index(drop=True)
+    result = result.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+    # Normalize per day so gross exposure never exceeds 1.0 across all tickers
+    gross = result.groupby("date")["position"].transform(lambda x: x.abs().sum())
+    result["position"] = result["position"] / gross.clip(lower=1.0)
+
+    return result
 
 
 if __name__ == "__main__":
@@ -188,8 +245,11 @@ if __name__ == "__main__":
 
     saved = list(Path("checkpoints").glob("model_*.pt"))
     assert len(saved) >= 2, f"Expected 2 checkpoint files, got {len(saved)}"
+    saved_scalers = list(Path("checkpoints").glob("scaler_*.pkl"))
+    assert len(saved_scalers) >= 2, f"Expected 2 scaler files, got {len(saved_scalers)}"
 
     print(f"Output: {len(out)} rows, {out['date'].nunique()} dates, {out['ticker'].nunique()} tickers  PASS")
     print(f"Columns: {out.columns.tolist()}  PASS")
     print(f"Position range: [{out['position'].min():.4f}, {out['position'].max():.4f}]  PASS")
     print(f"Checkpoints saved: {[p.name for p in saved]}  PASS")
+    print(f"Scalers saved: {[p.name for p in saved_scalers]}  PASS")

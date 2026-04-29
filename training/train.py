@@ -46,30 +46,30 @@ def train_model(train_dataset, val_dataset, config) -> nn.Module:
             X = X.to(device)
             ticker_id = ticker_id.to(device)
             fwd_return = fwd_return.to(device)
-            vs_factor = vs_factor.to(device)
             optimizer.zero_grad()
             positions = model(X, ticker_id)
-            loss = sharpe_loss(positions, fwd_return, vs_factor, config.TARGET_VOL)
+            loss = sharpe_loss(positions, fwd_return, config.TARGET_VOL)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+        # Accumulate all val batches before computing Sharpe
         model.eval()
-        val_losses = []
+        all_positions, all_fwd_returns = [], []
         with torch.no_grad():
             for X, _target, ticker_id, fwd_return, vs_factor in val_loader:
-                X = X.to(device)
-                ticker_id = ticker_id.to(device)
-                fwd_return = fwd_return.to(device)
-                vs_factor = vs_factor.to(device)
-                positions = model(X, ticker_id)
-                val_loss = sharpe_loss(positions, fwd_return, vs_factor, config.TARGET_VOL)
-                val_losses.append(val_loss.item())
+                positions = model(X.to(device), ticker_id.to(device)).cpu()
+                all_positions.append(positions)
+                all_fwd_returns.append(fwd_return)
 
-        if not val_losses:
+        if not all_positions:
             continue
 
-        mean_val_loss = sum(val_losses) / len(val_losses)
+        mean_val_loss = sharpe_loss(
+            torch.cat(all_positions),
+            torch.cat(all_fwd_returns),
+            config.TARGET_VOL,
+        ).item()
 
         if mean_val_loss < best_val_loss:
             best_val_loss = mean_val_loss
